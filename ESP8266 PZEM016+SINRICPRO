@@ -1,0 +1,212 @@
+#include <PZEM004Tv30.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include "SinricPro.h"
+#include "SinricProSwitch.h"
+
+// กำหนดค่าคงที่ (แก้ไขค่าเหล่านี้ตามต้องการ)
+const char* WIFI_SSID         = "...";
+const char* WIFI_PASS         = "...";
+const char* APP_KEY           = "...";
+const char* APP_SECRET        = "...";
+const char* SWITCH_ID_1       = "...";
+const char* SWITCH_ID_2       = "...";
+const char* SWITCH_ID_3       = "...";
+const int   RELAYPIN_1        = D0;
+const int   RELAYPIN_2        = D3;
+const int   RELAYPIN_3        = D4;
+const char* GAS_ID            = "...";
+
+// กำหนด Pins สำหรับ Serial Communication กับ PZEM
+SoftwareSerial pzemSerial(D5, D6);
+
+// สร้าง Object สำหรับ PZEM, LCD, และ WiFiClientSecure
+PZEM004Tv30 pzem(pzemSerial);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+WiFiClientSecure client;
+
+// กำหนดตัวแปรสำหรับจับเวลาและสถานะการส่งข้อมูล
+long lastMeasure = 0;
+long lastSend = 0;
+bool sendingData = false;
+
+// กำหนดตัวแปรสำหรับเก็บค่าที่อ่านจาก PZEM
+float voltage, current, power, pf, energy, frequency;
+
+// ฟังก์ชันเชื่อมต่อ WiFi
+bool connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+    yield(); // เพิ่ม yield() เพื่อให้ ESP8266 ทำงานอื่นได้
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    return true;
+  } else {
+    Serial.println("\nWiFi connection failed");
+    return false;
+  }
+}
+
+// ฟังก์ชันจัดการสถานะ Relay จาก Sinric Pro (Active Low)
+bool onPowerState(const String &deviceId, bool &state) {
+  if (deviceId == SWITCH_ID_1) {
+    digitalWrite(RELAYPIN_1, state ? HIGH : LOW);
+    Serial.printf("Relay 1 turned %s\n", state ? "ON" : "OFF");
+  } else if (deviceId == SWITCH_ID_2) {
+    digitalWrite(RELAYPIN_2, state ? HIGH : LOW);
+    Serial.printf("Relay 2 turned %s\n", state ? "ON" : "OFF");
+  } else if (deviceId == SWITCH_ID_3) {
+    digitalWrite(RELAYPIN_3, state ? HIGH : LOW);
+    Serial.printf("Relay 3 turned %s\n", state ? "ON" : "OFF");
+  }
+  return true; // แจ้งว่าอัปเดตสำเร็จ
+}
+
+// ฟังก์ชันตั้งค่า Sinric Pro
+void setupSinricPro() {
+  pinMode(RELAYPIN_1, OUTPUT);
+  pinMode(RELAYPIN_2, OUTPUT);
+  pinMode(RELAYPIN_3, OUTPUT);
+
+  digitalWrite(RELAYPIN_1, HIGH);  // ตั้งค่าเริ่มต้นเป็น HIGH (OFF สำหรับ Active Low)
+  digitalWrite(RELAYPIN_2, HIGH);
+  digitalWrite(RELAYPIN_3, HIGH);
+
+  SinricProSwitch &mySwitch1 = SinricPro[SWITCH_ID_1];
+  SinricProSwitch &mySwitch2 = SinricPro[SWITCH_ID_2];
+  SinricProSwitch &mySwitch3 = SinricPro[SWITCH_ID_3];
+
+  mySwitch1.onPowerState(onPowerState);
+  mySwitch2.onPowerState(onPowerState);
+  mySwitch3.onPowerState(onPowerState);
+
+  SinricPro.onConnected([]() { Serial.println("Connected to SinricPro"); });
+  SinricPro.onDisconnected([]() { Serial.println("Disconnected from SinricPro"); });
+
+  SinricPro.begin(APP_KEY, APP_SECRET);
+}
+
+// ฟังก์ชันส่งข้อมูลไปยัง Google Sheet (Non-Blocking)
+bool sendData(float voltage, float current, float pf, float energy, float frequency) {
+  if (sendingData) {
+    Serial.println("Already sending data. Skipping this cycle.");
+    return false; // ส่งคืน false เพื่อแจ้งว่าไม่สำเร็จ
+  }
+
+  sendingData = true;
+  Serial.println("Sending data to Google Sheet...");
+
+  WiFiClientSecure client;
+  client.setInsecure(); // TODO: Replace with certificate validation for security
+
+  String url = "/macros/s/" + String(GAS_ID) + "/exec?voltage=" + String(voltage) +
+               "&amp=" + String(current) + "&energy=" + String(energy) +
+               "&frequency=" + String(frequency) + "&pf=" + String(pf);
+
+  if (!client.connect("script.google.com", 443)) {
+    Serial.println("Connection to Google failed!");
+    sendingData = false;
+    return false; // ส่งคืน false เพื่อแจ้งว่าไม่สำเร็จ
+  }
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: script.google.com\r\n" +
+               "User-Agent: ESP8266\r\n" +
+               "Connection: close\r\n\r\n");
+
+  unsigned long startTime = millis();
+  while (client.connected() && (millis() - startTime < 10000)) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      Serial.println(line);
+      if (line == "\r") break;
+    }
+    yield();
+  }
+
+  Serial.println("Closing connection");
+  client.stop();
+  Serial.println("Data sent to Google Sheet.");
+  sendingData = false;
+  return true; // ส่งคืน true เพื่อแจ้งว่าสำเร็จ
+}
+
+// ฟังก์ชัน Setup
+void setup() {
+  Serial.begin(115200);
+  pzemSerial.begin(9600);
+  lcd.begin();
+  lcd.backlight();
+
+  // พยายามเชื่อมต่อ WiFi และหากล้มเหลว ให้วนซ้ำ
+  while (!connectWiFi()) {
+    Serial.println("Retrying WiFi connection in 5 seconds...");
+    delay(5000);
+  }
+
+  setupSinricPro();
+  client.setInsecure();
+}
+
+// ฟังก์ชัน Loop
+void loop() {
+  long now = millis();
+
+  // อ่านค่าทุก 3 วินาที
+  if (now - lastMeasure > 3000) {
+    voltage = pzem.voltage();
+    current = pzem.current();
+    power = pzem.power();
+    energy = pzem.energy();
+    frequency = pzem.frequency();
+    pf = pzem.pf();
+
+    if (isnan(voltage) || isnan(current) || isnan(power) || isnan(energy) || isnan(frequency) || isnan(pf)) {
+      Serial.println("Error reading from PZEM!");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("PZEM Error");
+    } else {
+      Serial.printf("Voltage: %.2f V, Current: %.2f A, Power: %.2f W, Frequency: %.2f Hz, PF: %.2f\n", voltage, current, power, frequency, pf);
+
+      // ตรวจสอบว่า LCD พร้อมใช้งานก่อนที่จะพยายามแสดงผลข้อมูล
+      if (lcd.getCols() > 0 && lcd.getRows() > 0) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("V:" + String(voltage) + "V");
+        lcd.setCursor(0, 1);
+        lcd.print("I:" + String(current) + "A");
+        lcd.setCursor(0, 2);
+        lcd.print("P:" + String(power) + "W");
+        lcd.setCursor(0, 3);
+        lcd.print("F:" + String(frequency) + "Hz");
+      }
+    }
+    lastMeasure = now;
+  }
+
+  // ส่งข้อมูลทุก 10 นาที
+  if (now - lastSend > 600000) {
+    Serial.println("Sending data to Google Sheet...");
+    if (sendData(voltage, current, pf, energy, frequency)) {
+      lastSend = now;
+    } else {
+      Serial.println("Failed to send data. Retrying later.");
+    }
+  }
+
+  // จัดการ Sinric Pro
+  SinricPro.handle();
+
+  // ปล่อยให้ ESP8266 ทำงานอื่น
+  yield();
+}
