@@ -1,0 +1,364 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+extern SPI_HandleTypeDef hspi1;
+extern UART_HandleTypeDef huart2;
+
+/* --- แมปขา CS ตามที่ตั้งไว้ --- */
+#define CS1_PORT GPIOB
+#define CS1_PIN  GPIO_PIN_1
+#define CS2_PORT GPIOB
+#define CS2_PIN  GPIO_PIN_15
+#define CS3_PORT GPIOB
+#define CS3_PIN  GPIO_PIN_14
+#define CS4_PORT GPIOB
+#define CS4_PIN  GPIO_PIN_13
+
+/* เก็บเป็นอาเรย์ จะเลือกทีละตัวได้ง่าย */
+static GPIO_TypeDef* CS_PORTS[4] = { CS1_PORT, CS2_PORT, CS3_PORT, CS4_PORT };
+static const uint16_t CS_PINS[4]  = { CS1_PIN,  CS2_PIN,  CS3_PIN,  CS4_PIN  };
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+#define DUTY(d)  ( ((uint32_t)(d) <= __HAL_TIM_GET_AUTORELOAD(&htim1)) ? \
+                   (uint32_t)(d) : __HAL_TIM_GET_AUTORELOAD(&htim1) )
+
+/* --------- UART debug พิมพ์ข้อความ --------- */
+static void uart_puts(const char* s) {
+  HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), 100);
+}
+
+/* --------- CS control --------- */
+static inline void uwb_cs_high_all(void){
+  for (int i=0;i<4;i++) HAL_GPIO_WritePin(CS_PORTS[i], CS_PINS[i], GPIO_PIN_SET);
+}
+static inline void uwb_cs_low(int idx){
+  HAL_GPIO_WritePin(CS_PORTS[idx], CS_PINS[idx], GPIO_PIN_RESET);
+}
+static inline void uwb_cs_high(int idx){
+  HAL_GPIO_WritePin(CS_PORTS[idx], CS_PINS[idx], GPIO_PIN_SET);
+}
+
+/* --------- ส่ง/รับ SPI --------- */
+static HAL_StatusTypeDef spi_xfer(uint8_t* tx, uint8_t* rx, uint16_t len){
+  return HAL_SPI_TransmitReceive(&hspi1, tx, rx, len, 100);
+}
+
+/* --------- สร้าง SPI header ของ DW1000 ---------
+   - bit7 = 0 (read), 1 (write)
+   - bit6 = 1 ถ้ามี subaddress
+   - bits5:0 = reg address (0..0x3F)
+   - ถ้ามี subaddress: byte2 = subaddr (bit7=1 ถ้าจะมี byte3 ต่อ)
+*/
+static uint16_t build_header(uint8_t reg, int has_sub, uint16_t sub, uint8_t* hdr){
+  uint16_t n = 1;
+  hdr[0] = reg & 0x3F;            // READ: bit7=0
+  if (has_sub){
+    hdr[0] |= (1u<<6);            // set sub bit
+    if (sub < 0x80){
+      hdr[1] = (uint8_t)sub;      // bit7=0 → ไม่มี byte3
+      n = 2;
+    } else {
+      hdr[1] = (uint8_t)(sub | 0x80); // bit7=1 → มี byte3 ต่อ
+      hdr[2] = (uint8_t)(sub >> 7);
+      n = 3;
+    }
+  }
+  return n;
+}
+
+/* อ่านเรจิสเตอร์ DW1000 แบบทั่วไป */
+static HAL_StatusTypeDef dw_read(int cs_idx, uint8_t reg, int has_sub, uint16_t sub,
+                                 uint8_t* data, uint16_t len)
+{
+  uint8_t hdr[3];
+  uint16_t hlen = build_header(reg, has_sub, sub, hdr);
+
+  uwb_cs_low(cs_idx);
+  if (HAL_SPI_Transmit(&hspi1, hdr, hlen, 100) != HAL_OK) { uwb_cs_high(cs_idx); return HAL_ERROR; }
+  if (HAL_SPI_Receive (&hspi1, data, len, 100) != HAL_OK) { uwb_cs_high(cs_idx); return HAL_ERROR; }
+  uwb_cs_high(cs_idx);
+  return HAL_OK;
+}
+
+
+/* รีเซ็ต DWM1000 ด้วย RSTn (PA15) — ต้องตั้งเป็น Open-Drain แล้วใน CubeMX */
+static void dw_reset_pulse(void){
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_Delay(5);  // 5–10 ms
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);
+  HAL_Delay(10); // รอโมดูลบูต
+}
+
+
+static void ramp_all(uint32_t from, uint32_t to, uint32_t step_ms){
+  if (from == to) {
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DUTY(to));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DUTY(to));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DUTY(to));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, DUTY(to));
+    HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE);
+    return;
+  }
+  if (from < to){
+    for (uint32_t d = from; d <= to; d++){
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, DUTY(d));
+      HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE);
+      HAL_Delay(step_ms);
+    }
+  } else {
+    for (int32_t d = (int32_t)from; d >= (int32_t)to; d--){
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DUTY(d));
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, DUTY(d));
+      HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE);
+      HAL_Delay(step_ms);
+    }
+  }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_TIM1_Init();
+  MX_SPI1_Init();
+  /* USER CODE BEGIN 2 */
+  // Start PWM on all 4 channels (TIM1 @ PA8/PA9/PA10/PA11)
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);   // PA8 -> PWM1
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   // PA9 -> PWM2
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);   // PA10 -> PWM3
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);   // PA11 -> PWM4
+
+  // ---- Initial safe states ----
+  // CSx are Active-LOW -> set HIGH (inactive)
+  HAL_GPIO_WritePin(GPIOB,GPIO_PIN_1  |  // CS1
+                          GPIO_PIN_13 |  // CS4
+                          GPIO_PIN_14 |  // CS3
+                          GPIO_PIN_15,   // CS2
+                    GPIO_PIN_SET);
+
+  // DIR pins -> LOW (stop)
+  HAL_GPIO_WritePin(GPIOB,GPIO_PIN_10 |  // DIR1
+                          GPIO_PIN_4  |  // DIR2
+                          GPIO_PIN_5  |  // DIR3
+                          GPIO_PIN_3,    // DIR4
+                  GPIO_PIN_RESET);
+
+  // UWB reset line: pulse PA15 low->high
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_Delay(5);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);
+
+  // PWM scale: ARR=49 => CCR 0..49 (~20 kHz)
+  const uint8_t slow   = 5;   // ~10%
+  const uint8_t medium = 15;  // ~30%
+  const uint8_t fast   = 25;  // ~50%
+
+  // Start with all motors stopped
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 0);
+  HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE);
+  
+  /* ดึง CS ทุกเส้นให้ HIGH (inactive) */
+  uwb_cs_high_all();
+
+  /* รีเซ็ตโมดูลทุกตัว */
+  dw_reset_pulse();
+
+  /* อ่าน Device ID จากแต่ละโมดูล */
+  for (int i=0;i<4;i++){
+    uint8_t dev_id[4] = {0};
+    if (dw_read(i, 0x00, 0, 0, dev_id, 4) == HAL_OK){
+      char msg[64];
+      snprintf(msg, sizeof(msg), "UWB%d DevID = %02X %02X %02X %02X\r\n",
+               i+1, dev_id[0], dev_id[1], dev_id[2], dev_id[3]);
+      uart_puts(msg);
+    } else {
+      char msg[32];
+      snprintf(msg, sizeof(msg), "UWB%d: SPI read FAIL\r\n", i+1);
+      uart_puts(msg);
+    }
+  }
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
